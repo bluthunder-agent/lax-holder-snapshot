@@ -12,7 +12,7 @@ Read only. It never signs or sends a transaction and never needs to hold the tok
 npm ci
 npm test          # node:test via tsx
 npm run typecheck
-npm run mutate    # plants 22 bugs one at a time; each must make the suite fail
+npm run mutate    # plants 29 bugs one at a time; each must make the suite fail
 ```
 
 ## Library
@@ -51,17 +51,50 @@ lax-holder-snapshot/v1 mint=<mint or -> slot=<slot or -> top=<top>
 
 each line ending in `\n`. Anyone can recompute it from `snapshot.json` with a few lines of code.
 
+## Exclusions file
+
+Exclusions can be kept in a JSON file with four optional categories:
+
+```json
+{
+  "version": 1,
+  "curve": ["<bonding curve owner>"],
+  "pools": [{ "account": "<pool vault token account>", "label": "AMM vault" }],
+  "burn": [{ "owner": "1nc1nerator11111111111111111111111111111111", "label": "incinerator" }],
+  "project_wallets": [{ "owner": "<treasury owner>", "label": "treasury" }]
+}
+```
+
+- A bare string is a wallet **owner**: every token account of that owner is dropped.
+- `{ "owner": ... }` does the same; `{ "account": ... }` drops one token account only (e.g. a pool vault),
+  so the same owner's other accounts still count. Give exactly one of `owner` or `account`; `label` is an optional note.
+- Strict: unknown keys, `version` other than 1, non base58 addresses and malformed entries throw `SnapshotError`.
+- Order and duplicates do not matter; addresses are de-duplicated and sorted.
+- `exclusions.example.json` is a valid starting file (burn = Solana incinerator; fill in the rest per mint).
+
+```ts
+import { loadExclusionsFile, snapshot } from "lax-holder-snapshot";
+const ex = loadExclusionsFile("exclusions.json"); // { owners, accounts, byCategory }
+snapshot({ accounts, exclusions: ex, mint, slot });
+```
+
+The exclusion list is not part of the hash input (the hash covers the resulting holders, mint, slot and top),
+so the CLI writes the merged `exclusions` into `snapshot.json` for audit.
+
 ## CLI
 
 ```sh
 # live: Token-2022 by default, use --program token for classic SPL Token
 npm run snapshot -- --mint <MINT> --top 100 \
-  --exclude-owner <CURVE>,<POOL> --exclude-account <VAULT> \
+  --exclusions exclusions.json \
+  --exclude-owner <EXTRA_OWNER> --exclude-account <EXTRA_VAULT> \
   --rpc https://api.mainnet-beta.solana.com --min-slot <SLOT> --out out/
 
 # offline: re-hash a saved fixture, should print the same hash
-npm run snapshot -- --fixture out/fixture.json --top 100 --exclude-owner <CURVE>,<POOL> --out out2/
+npm run snapshot -- --fixture out/fixture.json --top 100 --exclusions exclusions.json --out out2/
 ```
+
+`--exclusions` and the `--exclude-*` flags are merged (union).
 
 It calls `getProgramAccounts` with a memcmp filter on the mint (offset 0), `dataSlice` 0..72
 (mint, owner, amount only) and `withContext`, so the result records the slot the node served.

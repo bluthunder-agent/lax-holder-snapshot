@@ -21,4 +21,11 @@ export const MUTANTS = [
   { name: "rpc mint filter dropped", file: "src/rpc.ts", from: "filters: [{ memcmp: { offset: 0, bytes: opts.mint } }],", to: "filters: [],"},
   { name: "rpc foreign mint accepted", file: "src/rpc.ts", from: "if (head.mint !== opts.mint) throw", to: "if (false) throw" },
   { name: "minContextSlot dropped", file: "src/rpc.ts", from: "config.minContextSlot = opts.minContextSlot;", to: "" },
+  { name: "exclusions: unknown keys accepted", file: "src/exclusions.ts", from: "throw new SnapshotError(`exclusions file: unknown key", to: "void (`exclusions file: unknown key" },
+  { name: "exclusions: object accounts ignored", file: "src/exclusions.ts", from: "else bucket.accounts.push(addr(o.account, where));", to: "" },
+  { name: "exclusions: bare string treated as account", file: "src/exclusions.ts", from: "bucket.owners.push(addr(e, where));\n        return;", to: "bucket.accounts.push(addr(e, where));\n        return;" },
+  { name: "exclusions: one category skipped", file: "src/exclusions.ts", from: "\"curve\", \"pools\", \"burn\", \"project_wallets\"] as const", to: "\"curve\", \"pools\", \"burn\"] as const" },
+  { name: "exclusions: address not validated", file: "src/exclusions.ts", from: "!B58_RE.test(v)) throw", to: "false) throw" },
+  { name: "exclusions: owner+account both allowed", file: "src/exclusions.ts", from: "if ((o.owner === undefined) === (o.account === undefined))", to: "if (o.owner === undefined && o.account === undefined)" },
+  { name: "cli ignores exclusions file", file: "src/cli.ts", from: "values.exclusions ? loadExclusionsFile(values.exclusions) : {}", to: "{}" },
 ];
