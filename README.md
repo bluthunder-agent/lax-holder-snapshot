@@ -11,7 +11,7 @@ npm run typecheck
 npm test          # node:test via tsx: 31 tests (24 for snapshot(), 7 for the CLI), no network
 ```
 
-CI (GitHub Actions, Node 20 and 22) runs `npm ci`, `npm run typecheck` and `npm test`.
+There is no CI workflow in this repository yet; run the three commands above locally (Node 20 or newer).
 
 ## Library: `src/snapshot.ts` exports `snapshot`
 
