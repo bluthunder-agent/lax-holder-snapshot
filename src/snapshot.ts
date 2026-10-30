@@ -17,6 +17,9 @@ const UINT_RE = /^[0-9]+$/;
  *   holders.map(h => `${h.rank},${h.owner},${h.amount}`).join('\n')
  * with no header and no trailing newline.
  *
+ * A token account pubkey that appears twice in `accounts` throws a TypeError (excluded accounts included): it
+ * would be counted twice, so the input is wrong.
+ *
  * Pure: no I/O, and the order of the accounts never changes the result.
  */
 export function snapshot(input: {
@@ -28,12 +31,15 @@ export function snapshot(input: {
   if (!Number.isInteger(top) || top < 0) throw new TypeError("top must be a non negative integer");
   const excluded = new Set<string>(input.exclusions ?? []);
   const totals = new Map<string, bigint>();
+  const seen = new Set<string>();
 
   for (const acc of input.accounts) {
     if (typeof acc.pubkey !== "string" || typeof acc.owner !== "string")
       throw new TypeError("account pubkey and owner must be strings");
     if (typeof acc.amount !== "string" || !UINT_RE.test(acc.amount))
       throw new TypeError(`account ${acc.pubkey}: amount must be a base 10 integer string`);
+    if (seen.has(acc.pubkey)) throw new TypeError(`duplicate token account pubkey ${acc.pubkey}`);
+    seen.add(acc.pubkey);
     if (excluded.has(acc.owner) || excluded.has(acc.pubkey)) continue;
     totals.set(acc.owner, (totals.get(acc.owner) ?? 0n) + BigInt(acc.amount));
   }

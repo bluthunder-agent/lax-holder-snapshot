@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fetchAccounts, loadExclusions, parseExclusions, run, toTokenAccounts, TOKEN_2022_PROGRAM, type FetchLike } from "../src/cli.ts";
+import { ACCOUNT_TYPE_ACCOUNT_B58, accountFilters, fetchAccounts, loadExclusions, parseExclusions, run, toTokenAccounts, TOKEN_2022_PROGRAM, type FetchLike } from "../src/cli.ts";
 import { snapshot } from "../src/snapshot.ts";
 
 const MINT = "mintMINT";
@@ -13,11 +13,18 @@ const entry = (pubkey: string, owner: string, amount: string, mint = MINT) => ({
 });
 const ENTRIES = [entry("t1", "alice", "100"), entry("t2", "bob", "100"), entry("t3", "carol", "300"), entry("vault", "pool", "999")];
 
-function fakeFetch(value: unknown[], slot = 4242) {
+// Returns `value` for the plain (dataSize) query and `extended` for the extended-account query; records the calls.
+function fakeFetch(value: unknown[], slot = 4242, extended: unknown[] = [], extendedSlot = slot) {
   const calls: { url: string; body: any }[] = [];
   const f: FetchLike = async (url, init) => {
-    calls.push({ url, body: JSON.parse(init.body) });
-    return { ok: true, status: 200, json: async () => ({ jsonrpc: "2.0", id: 1, result: { context: { slot }, value } }) };
+    const body = JSON.parse(init.body);
+    calls.push({ url, body });
+    const isPlain = body.params[1].filters.some((x: any) => x.dataSize !== undefined);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ jsonrpc: "2.0", id: 1, result: { context: { slot: isPlain ? slot : extendedSlot }, value: isPlain ? value : extended } }),
+    };
   };
   return { f, calls };
 }
@@ -38,17 +45,57 @@ test("the shipped example exclusions file loads", () => {
   assert.deepEqual(loadExclusions(new URL("../exclusions.example.json", import.meta.url).pathname), ["1nc1nerator11111111111111111111111111111111"]);
 });
 
-test("request is getProgramAccounts on Token-2022, jsonParsed, filtered by mint, with context", async () => {
+test("two getProgramAccounts requests on Token-2022, jsonParsed, with context, each filtered by mint", async () => {
   const { f, calls } = fakeFetch(ENTRIES);
   await fetchAccounts({ rpc: "http://rpc.test", mint: MINT, fetch: f });
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0]!.url, "http://rpc.test");
-  const b = calls[0]!.body;
-  assert.equal(b.method, "getProgramAccounts");
-  assert.equal(b.params[0], TOKEN_2022_PROGRAM);
-  assert.equal(b.params[1].encoding, "jsonParsed");
-  assert.equal(b.params[1].withContext, true);
-  assert.deepEqual(b.params[1].filters, [{ memcmp: { offset: 0, bytes: MINT } }]);
+  assert.equal(calls.length, 2);
+  for (const c of calls) {
+    assert.equal(c.url, "http://rpc.test");
+    assert.equal(c.body.method, "getProgramAccounts");
+    assert.equal(c.body.params[0], TOKEN_2022_PROGRAM);
+    assert.equal(c.body.params[1].encoding, "jsonParsed");
+    assert.equal(c.body.params[1].withContext, true);
+    assert.ok(c.body.params[1].filters.some((x: any) => x.memcmp?.offset === 0 && x.memcmp.bytes === MINT));
+  }
+});
+
+test("plain query uses dataSize 165; extended query uses the AccountType tag at offset 165 (no dataSize)", async () => {
+  const { f, calls } = fakeFetch(ENTRIES);
+  await fetchAccounts({ rpc: "http://rpc.test", mint: MINT, fetch: f });
+  assert.deepEqual(calls[0]!.body.params[1].filters, [{ dataSize: 165 }, { memcmp: { offset: 0, bytes: MINT } }]);
+  assert.deepEqual(calls[1]!.body.params[1].filters, [{ memcmp: { offset: 165, bytes: "3" } }, { memcmp: { offset: 0, bytes: MINT } }]);
+  assert.deepEqual(accountFilters(MINT), { plain: calls[0]!.body.params[1].filters, extended: calls[1]!.body.params[1].filters });
+  assert.equal(calls[1]!.body.params[1].filters.some((x: any) => x.dataSize !== undefined), false);
+  assert.equal(calls[0]!.body.params[1].minContextSlot, undefined);
+});
+
+test("AccountType filter byte: base58 '3' is the single byte 0x02", () => {
+  const ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  assert.equal(ALPHABET.indexOf(ACCOUNT_TYPE_ACCOUNT_B58), 2);
+  assert.equal(ACCOUNT_TYPE_ACCOUNT_B58.length, 1);
+});
+
+test("extended accounts are included, the slot is the first query's, and the second query sends minContextSlot", async () => {
+  const ext = [entry("x1", "dave", "500")];
+  const { f, calls } = fakeFetch(ENTRIES, 100, ext, 103);
+  const { slot, accounts } = await fetchAccounts({ rpc: "http://rpc.test", mint: MINT, fetch: f });
+  assert.equal(slot, 100);
+  assert.equal(calls[1]!.body.params[1].minContextSlot, 100);
+  assert.deepEqual(accounts.map((a) => a.pubkey), ["t1", "t2", "t3", "vault", "x1"]);
+});
+
+test("run includes extended accounts in the snapshot", async () => {
+  const { f } = fakeFetch(ENTRIES, 5, [entry("x1", "dave", "500")]);
+  const out = await run(["--rpc", "http://rpc.test", "--mint", MINT, "--exclusions", exFile([]), "--top", "2"], { fetch: f });
+  assert.deepEqual(out.holders.map((h) => h.owner), ["pool", "dave"]);
+});
+
+test("the same token account returned by both queries is rejected as a duplicate pubkey", async () => {
+  const { f } = fakeFetch(ENTRIES, 5, [entry("t1", "alice", "100")]);
+  await assert.rejects(
+    run(["--rpc", "http://rpc.test", "--mint", MINT, "--exclusions", exFile([])], { fetch: f }),
+    /duplicate token account pubkey t1/,
+  );
 });
 
 test("jsonParsed entries map to TokenAccount {pubkey, owner, amount}", () => {

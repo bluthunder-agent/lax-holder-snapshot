@@ -201,3 +201,14 @@ test("top must be an integer", () => {
     assert.throws(() => snapshot({ accounts: FIXTURE, exclusions: [], top: bad }), TypeError, String(bad));
   assert.deepEqual(snapshot({ accounts: FIXTURE, exclusions: [], top: 0 }).holders, []);
 });
+
+test("a duplicate token account pubkey throws a TypeError (same owner, different owner, even when excluded)", () => {
+  assert.throws(() => snapshot({ accounts: [acc("t1", "a", "1"), acc("t1", "a", "1")] }), { name: "TypeError", message: /duplicate token account pubkey t1/ });
+  assert.throws(() => snapshot({ accounts: [acc("t1", "a", "1"), acc("t1", "b", "2")] }), /duplicate token account pubkey t1/);
+  assert.throws(() => snapshot({ accounts: [acc("t1", "a", "1"), acc("t2", "b", "1"), acc("t1", "a", "1")], exclusions: ["a"] }), /duplicate token account pubkey t1/);
+});
+
+test("distinct pubkeys with the same owner and repeated owners are still fine", () => {
+  const r = snapshot({ accounts: [acc("t1", "a", "1"), acc("t2", "a", "2")] });
+  assert.deepEqual(r.holders, [{ rank: 1, owner: "a", amount: "3" }]);
+});

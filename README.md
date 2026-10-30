@@ -8,7 +8,7 @@ Read only: it never signs or sends a transaction and never needs to hold the tok
 ```sh
 npm ci
 npm run typecheck
-npm test          # node:test via tsx: 31 tests (24 for snapshot(), 7 for the CLI), no network
+npm test          # node:test via tsx: 38 tests (26 for snapshot(), 12 for the CLI), no network
 ```
 
 There is no CI workflow in this repository yet; run the three commands above locally (Node 20 or newer).
@@ -48,7 +48,9 @@ with no header and no trailing newline. For no holders it is the sha256 of the e
 
 Validation is deliberately light so short fixture names such as `"alice"` work: `pubkey` and `owner` must be strings,
 `amount` must match `^[0-9]+$` (a string, never a JS number), and `top` must be a non negative integer. Anything else
-throws a `TypeError`. Addresses are not checked for base58, and duplicate token account addresses are not rejected.
+throws a `TypeError`. Addresses are not checked for base58. A token account `pubkey` that appears twice in `accounts` also
+throws a `TypeError` (`duplicate token account pubkey ...`), whether or not that account is excluded, because it would
+be counted twice.
 
 ## Exclusions file
 
@@ -67,17 +69,34 @@ npx tsx src/cli.ts --rpc <url> --mint <mint> --exclusions <file> [--top 100]
 ```
 
 It reads every token account of the mint with `getProgramAccounts` on the Token-2022 program
-(`TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`), `jsonParsed`, filtered by mint (memcmp at offset 0), with
-`withContext` so the response carries the slot. It maps each account to `{ pubkey, owner, amount }`
-(`amount` is `tokenAmount.amount`), runs `snapshot` and prints one JSON object on stdout:
+(`TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`), `jsonParsed`, with `withContext` so the response carries the slot.
+It maps each account to `{ pubkey, owner, amount }` (`amount` is `tokenAmount.amount`), runs `snapshot` and prints
+one JSON object on stdout:
 
 ```json
 { "mint": "...", "slot": 123, "top": 100, "holders": [{ "rank": 1, "owner": "...", "amount": "..." }], "hash": "..." }
 ```
 
+### Why two queries (dataSize)
+
+Token-2022 token accounts are not a fixed size. A plain account is 165 bytes, but an account with extensions (transfer
+fee, memo required, ...) is longer, so one `dataSize: 165` filter would silently drop every extended account. The CLI
+therefore sends two disjoint queries, both with `memcmp` offset 0 = the mint:
+
+| Query | Extra filter | Matches |
+|---|---|---|
+| plain | `dataSize: 165` | 165-byte accounts |
+| extended | `memcmp` offset 165 = `3` (base58 of the byte `0x02`, the AccountType tag for a token account) | accounts with extensions (byte 165 is the AccountType; mints carry `1` there) |
+
+A plain account has no byte 165 and an extended one is longer than 165, so the two sets never overlap. Every result
+entry is also checked to be a parsed token account of the requested mint, and `snapshot` rejects duplicate pubkeys, so
+an overlap or a repeated entry would fail loudly. The two queries are not atomic: `slot` is the context slot of the
+first (plain) query, and the second sends `minContextSlot` = that slot so it is never older; extended-account balances
+may be a few slots newer.
+
 `--rpc`, `--mint` and `--exclusions` are required. Errors go to stderr with exit code 1.
 
-The tests cover the CLI with a stub `fetch` (request shape, mapping, output keys). The CLI has not been run
+The tests cover the CLI with a stub `fetch` (both request shapes and filters, mapping, output keys, duplicate rejection). The CLI has not been run
 against a live RPC since this rewrite, and a very large mint may be refused by public RPCs for `getProgramAccounts`;
 pass `--rpc` for another endpoint.
 
