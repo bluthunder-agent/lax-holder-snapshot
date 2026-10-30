@@ -1,66 +1,113 @@
 #!/usr/bin/env -S node --import tsx
-// Usage:
-//   holder-snapshot --mint <MINT> [--rpc URL] [--program token|token2022] [--min-slot N]
-//                   [--top 100] [--exclusions exclusions.json] [--exclude-owner A,B] [--exclude-account X,Y] [--out DIR]
-//   holder-snapshot --fixture accounts.json [...same flags]   (offline, re-hash a saved fixture)
-// Writes <out>/fixture.json (raw accounts + slot) and <out>/snapshot.json (holders + hash).
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+// Usage: npx tsx src/cli.ts --rpc <url> --mint <mint> --exclusions <file> [--top 100]
+//
+// Reads every token account of the mint (getProgramAccounts on the Token-2022 program, jsonParsed,
+// filtered by mint), notes the context slot, maps the accounts to TokenAccount and prints one JSON
+// object on stdout: { mint, slot, top, holders, hash }. Read only: it never signs or sends a transaction.
+import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
-import { snapshot } from "./snapshot.ts";
-import { loadExclusionsFile, mergeExclusions } from "./exclusions.ts";
-import { fetchMintAccounts, TOKEN_2022_PROGRAM, TOKEN_PROGRAM, type FetchResult } from "./rpc.ts";
+import { snapshot, type Holder, type TokenAccount } from "./snapshot.ts";
 
-const { values } = parseArgs({
-  options: {
-    mint: { type: "string" },
-    rpc: { type: "string", default: "https://api.mainnet-beta.solana.com" },
-    program: { type: "string", default: "token2022" },
-    "min-slot": { type: "string" },
-    top: { type: "string", default: "100" },
-    "exclude-owner": { type: "string", default: "" },
-    "exclude-account": { type: "string", default: "" },
-    exclusions: { type: "string" },
-    fixture: { type: "string" },
-    out: { type: "string", default: "out" },
-  },
-});
+export const TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
-const list = (s: string | undefined) => (s ? s.split(",").map((x) => x.trim()).filter(Boolean) : []);
+export type FetchLike = (
+  url: string,
+  init: { method: string; headers: Record<string, string>; body: string },
+) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
 
-async function main() {
-  let data: FetchResult & { mint: string };
-  if (values.fixture) {
-    data = JSON.parse(readFileSync(values.fixture, "utf8"));
-  } else {
-    if (!values.mint) throw new Error("--mint or --fixture is required");
-    const programId = values.program === "token" ? TOKEN_PROGRAM : TOKEN_2022_PROGRAM;
-    const r = await fetchMintAccounts({
-      rpcUrl: values.rpc!,
-      mint: values.mint,
-      programId,
-      minContextSlot: values["min-slot"] ? Number(values["min-slot"]) : undefined,
-    });
-    data = { mint: values.mint, ...r };
-  }
-  const exclusions = mergeExclusions(
-    values.exclusions ? loadExclusionsFile(values.exclusions) : {},
-    { owners: list(values["exclude-owner"]), accounts: list(values["exclude-account"]) },
-  );
-  const result = snapshot({
-    accounts: data.accounts,
-    mint: data.mint,
-    slot: data.slot,
-    top: Number(values.top),
-    exclusions,
-  });
-  mkdirSync(values.out!, { recursive: true });
-  if (!values.fixture) writeFileSync(join(values.out!, "fixture.json"), JSON.stringify(data, null, 2) + "\n");
-  writeFileSync(join(values.out!, "snapshot.json"), JSON.stringify({ mint: data.mint, slot: data.slot, exclusions, ...result }, null, 2) + "\n");
-  console.log(`slot ${data.slot}  accounts ${data.accounts.length}  holders ${result.totalHolders}  hash ${result.hash}`);
+/** The exclusions file is a JSON array of address strings (matched against owner or token account). */
+export function parseExclusions(data: unknown): string[] {
+  if (!Array.isArray(data) || !data.every((x) => typeof x === "string"))
+    throw new Error("exclusions file must be a JSON array of strings");
+  return data as string[];
 }
 
-main().catch((e) => {
-  console.error(String(e instanceof Error ? e.message : e));
-  process.exit(1);
-});
+export function loadExclusions(path: string): string[] {
+  return parseExclusions(JSON.parse(readFileSync(path, "utf8")));
+}
+
+type ParsedEntry = {
+  pubkey: string;
+  account: { data?: { parsed?: { info?: { mint?: string; owner?: string; tokenAmount?: { amount?: string } } } } };
+};
+
+/** Map jsonParsed getProgramAccounts entries to TokenAccount. Entries of another mint are rejected. */
+export function toTokenAccounts(entries: readonly ParsedEntry[], mint: string): TokenAccount[] {
+  return entries.map((e) => {
+    const info = e.account?.data?.parsed?.info;
+    const amount = info?.tokenAmount?.amount;
+    if (!info || typeof info.owner !== "string" || typeof amount !== "string")
+      throw new Error(`account ${e.pubkey}: not a parsed token account`);
+    if (info.mint !== mint) throw new Error(`account ${e.pubkey}: mint ${info.mint} is not ${mint}`);
+    return { pubkey: e.pubkey, owner: info.owner, amount };
+  });
+}
+
+export async function fetchAccounts(opts: {
+  rpc: string;
+  mint: string;
+  fetch?: FetchLike;
+}): Promise<{ slot: number; accounts: TokenAccount[] }> {
+  const f = opts.fetch ?? (globalThis.fetch as unknown as FetchLike);
+  const res = await f(opts.rpc, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "getProgramAccounts",
+      params: [
+        TOKEN_2022_PROGRAM,
+        {
+          encoding: "jsonParsed",
+          commitment: "finalized",
+          withContext: true,
+          filters: [{ memcmp: { offset: 0, bytes: opts.mint } }],
+        },
+      ],
+    }),
+  });
+  if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
+  const body = (await res.json()) as {
+    error?: { message?: string };
+    result?: { context?: { slot?: number }; value?: ParsedEntry[] };
+  };
+  if (body.error) throw new Error(`RPC error: ${body.error.message ?? "unknown"}`);
+  const slot = body.result?.context?.slot;
+  if (typeof slot !== "number" || !Array.isArray(body.result?.value)) throw new Error("RPC returned no context or value");
+  return { slot, accounts: toTokenAccounts(body.result.value, opts.mint) };
+}
+
+export async function run(
+  argv: string[],
+  deps: { fetch?: FetchLike } = {},
+): Promise<{ mint: string; slot: number; top: number; holders: Holder[]; hash: string }> {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      rpc: { type: "string" },
+      mint: { type: "string" },
+      exclusions: { type: "string" },
+      top: { type: "string", default: "100" },
+    },
+  });
+  if (!values.rpc || !values.mint || !values.exclusions)
+    throw new Error("usage: --rpc <url> --mint <mint> --exclusions <file> [--top 100]");
+  if (!/^[0-9]+$/.test(values.top!)) throw new Error("--top must be a non negative integer");
+  const top = Number(values.top);
+  const exclusions = loadExclusions(values.exclusions);
+  const { slot, accounts } = await fetchAccounts({ rpc: values.rpc, mint: values.mint, fetch: deps.fetch });
+  const { holders, hash } = snapshot({ accounts, exclusions, top });
+  return { mint: values.mint, slot, top, holders, hash };
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run(process.argv.slice(2)).then(
+    (out) => console.log(JSON.stringify(out)),
+    (e) => {
+      console.error(String(e instanceof Error ? e.message : e));
+      process.exit(1);
+    },
+  );
+}

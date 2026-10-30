@@ -1,111 +1,84 @@
 # lax-holder-snapshot
 
-CI: GitHub Actions workflow (Node 20 and 22: typecheck, test, mutation check) is being added; until then run `npm ci && npm run typecheck && npm test && npm run mutate`.
-
-Deterministic top N holder snapshot for an SPL Token or Token-2022 mint, with a stable sha256 hash:
-the same accounts, exclusions, slot and mint always give the same hash, whatever the input order.
-Read only. It never signs or sends a transaction and never needs to hold the token.
+Deterministic top N holder snapshot for a Token-2022 mint, with a stable sha256 hash.
+Read only: it never signs or sends a transaction and never needs to hold the token.
 
 ## Install and test
 
 ```sh
 npm ci
-npm test          # node:test via tsx
 npm run typecheck
-npm run mutate    # plants 29 bugs one at a time; each must make the suite fail
+npm test          # node:test via tsx: 31 tests (24 for snapshot(), 7 for the CLI), no network
 ```
 
-## Library
+CI (GitHub Actions, Node 20 and 22) runs `npm ci`, `npm run typecheck` and `npm test`.
+
+## Library: `src/snapshot.ts` exports `snapshot`
 
 ```ts
-import { snapshot } from "lax-holder-snapshot";
+import { snapshot } from "./src/snapshot.ts";
 
-const { holders, hash, totalHolders } = snapshot({
-  accounts,                 // [{ pubkey, owner, amount: "123" | 123n, mint? }]
-  exclusions: {
-    owners: [curve, pool],  // drop every account of these wallets
-    accounts: [vault],      // drop single token accounts
-  },
-  top: 100,                 // default 100
-  mint, slot,               // optional, bound into the hash
+const { holders, hash } = snapshot({
+  accounts,      // { pubkey: string; owner: string; amount: string }[]  (amount: base 10 integer string, atomic units)
+  exclusions,    // string[]  (optional; an account is left out when its owner OR its pubkey is in the list)
+  top,           // integer, 100 when absent
 });
-// holders: [{ rank: 1, owner, amount: "1000", accounts: 2 }, ...]
+// holders: { rank: number; owner: string; amount: string }[]   (rank from 1)
+// hash:    64 lowercase hex characters
 ```
+
+The output is exactly `{ holders, hash }` and each holder is exactly `{ rank, owner, amount }`.
 
 Rules, in order:
 
-1. Validate: base58 pubkeys and owners, integer amounts in u64 range (strings or bigint, never JS numbers),
-   no duplicate token accounts, every account's mint equals `mint` when given.
-2. Drop excluded owners, excluded token accounts and zero balances.
-3. Sum amounts per owner with bigint (exact above 2^53).
-4. Sort by amount descending, then owner ascending in byte order (not locale order).
-5. Keep the first `top`, ranks start at 1.
-6. Hash: sha256 over UTF-8 of
+1. Leave out every account whose `owner` or `pubkey` is in `exclusions`.
+2. Sum the remaining amounts per owner with BigInt (exact above 2^53); amounts come back as base 10 strings.
+3. Leave out owners whose total is zero.
+4. Sort by amount descending, then owner ascending (plain JavaScript string comparison, i.e. UTF-16 code units, not locale order).
+5. Keep the first `top`; ranks start at 1.
+6. `hash` = sha256 of the UTF-8 text
 
 ```
-lax-holder-snapshot/v1 mint=<mint or -> slot=<slot or -> top=<top>
-1,<owner>,<amount>
-2,<owner>,<amount>
-...
+holders.map(h => `${h.rank},${h.owner},${h.amount}`).join('\n')
 ```
 
-each line ending in `\n`. Anyone can recompute it from `snapshot.json` with a few lines of code.
+with no header and no trailing newline. For no holders it is the sha256 of the empty text.
+
+`snapshot` is pure and the order of the accounts (or of the exclusions) never changes the result.
+
+Validation is deliberately light so short fixture names such as `"alice"` work: `pubkey` and `owner` must be strings,
+`amount` must match `^[0-9]+$` (a string, never a JS number), and `top` must be a non negative integer. Anything else
+throws a `TypeError`. Addresses are not checked for base58, and duplicate token account addresses are not rejected.
 
 ## Exclusions file
 
-Exclusions can be kept in a JSON file with four optional categories:
+A JSON array of address strings. An account is left out when its owner or its token account address is in the array:
 
 ```json
-{
-  "version": 1,
-  "curve": ["<bonding curve owner>"],
-  "pools": [{ "account": "<pool vault token account>", "label": "AMM vault" }],
-  "burn": [{ "owner": "1nc1nerator11111111111111111111111111111111", "label": "incinerator" }],
-  "project_wallets": [{ "owner": "<treasury owner>", "label": "treasury" }]
-}
+["1nc1nerator11111111111111111111111111111111", "<bonding curve owner>", "<pool vault token account>"]
 ```
 
-- A bare string is a wallet **owner**: every token account of that owner is dropped.
-- `{ "owner": ... }` does the same; `{ "account": ... }` drops one token account only (e.g. a pool vault),
-  so the same owner's other accounts still count. Give exactly one of `owner` or `account`; `label` is an optional note.
-- Strict: unknown keys, `version` other than 1, non base58 addresses and malformed entries throw `SnapshotError`.
-- Order and duplicates do not matter; addresses are de-duplicated and sorted.
-- `exclusions.example.json` is a valid starting file (burn = Solana incinerator; fill in the rest per mint).
-
-```ts
-import { loadExclusionsFile, snapshot } from "lax-holder-snapshot";
-const ex = loadExclusionsFile("exclusions.json"); // { owners, accounts, byCategory }
-snapshot({ accounts, exclusions: ex, mint, slot });
-```
-
-The exclusion list is not part of the hash input (the hash covers the resulting holders, mint, slot and top),
-so the CLI writes the merged `exclusions` into `snapshot.json` for audit.
+`exclusions.example.json` is a starting file (burn address only; add the curve, pools and project wallets per mint).
 
 ## CLI
 
 ```sh
-# live: Token-2022 by default, use --program token for classic SPL Token
-npm run snapshot -- --mint <MINT> --top 100 \
-  --exclusions exclusions.json \
-  --exclude-owner <EXTRA_OWNER> --exclude-account <EXTRA_VAULT> \
-  --rpc https://api.mainnet-beta.solana.com --min-slot <SLOT> --out out/
-
-# offline: re-hash a saved fixture, should print the same hash
-npm run snapshot -- --fixture out/fixture.json --top 100 --exclusions exclusions.json --out out2/
+npx tsx src/cli.ts --rpc <url> --mint <mint> --exclusions <file> [--top 100]
 ```
 
-`--exclusions` and the `--exclude-*` flags are merged (union).
+It reads every token account of the mint with `getProgramAccounts` on the Token-2022 program
+(`TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`), `jsonParsed`, filtered by mint (memcmp at offset 0), with
+`withContext` so the response carries the slot. It maps each account to `{ pubkey, owner, amount }`
+(`amount` is `tokenAmount.amount`), runs `snapshot` and prints one JSON object on stdout:
 
-It calls `getProgramAccounts` with a memcmp filter on the mint (offset 0), `dataSlice` 0..72
-(mint, owner, amount only) and `withContext`, so the result records the slot the node served.
-`--min-slot` makes the node refuse to answer from an older slot. Classic Token adds `dataSize: 165`;
-Token-2022 accounts with extensions are longer, so no size filter is used there.
+```json
+{ "mint": "...", "slot": 123, "top": 100, "holders": [{ "rank": 1, "owner": "...", "amount": "..." }], "hash": "..." }
+```
 
-Verified live against the public mainnet RPC on 2026-10-20 with PYUSD (Token-2022):
-494,759 accounts, 58,078 non zero holders, fetched and re-hashed from the fixture with an identical hash.
+`--rpc`, `--mint` and `--exclusions` are required. Errors go to stderr with exit code 1.
 
-Notes: a single RPC call cannot pin an exact historical slot; for a strict slot snapshot use an RPC
-that serves at a slot (or an archive) and save `fixture.json` as the evidence. Some public RPCs rate limit
-or refuse `getProgramAccounts` for very large mints; pass `--rpc` to use another endpoint.
+The tests cover the CLI with a stub `fetch` (request shape, mapping, output keys). The CLI has not been run
+against a live RPC since this rewrite, and a very large mint may be refused by public RPCs for `getProgramAccounts`;
+pass `--rpc` for another endpoint.
 
-MIT licensed. Built by BluThunder (bluthunder@agentmail.to).
+MIT licensed (see LICENSE). Built by BluThunder (bluthunder@agentmail.to).
